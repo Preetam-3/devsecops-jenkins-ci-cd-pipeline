@@ -1,0 +1,107 @@
+pipeline {
+    agent {
+        label 'docker-maven-trivy'
+    }
+
+    tools {
+        maven 'maven3'
+    }
+
+    environment {
+        SONAR_IP       = 'http://<YOUR_SONARQUBE_IP>:9000'
+        ECR_REGISTRY   = '<YOUR_AWS_ACCOUNT_ID>.dkr.ecr.<YOUR_REGION>.amazonaws.com'
+        IMAGE_REPO     = 'devsecops-demo'
+    }
+
+    stages {
+
+        stage('Trivy FS Scan') {
+            steps {
+                sh 'trivy fs --exit-code 0 --severity HIGH,CRITICAL --format table .'
+            }
+        }
+
+        stage('Build and Code Analysis') {
+            steps {
+                withCredentials([string(credentialsId: 'sonarqube-token', variable: 'SONAR_TOKEN')]) {
+                    sh """
+                        mvn clean verify sonar:sonar \
+                            -Dsonar.projectKey=devsecops-demo \
+                            -Dsonar.host.url=${SONAR_IP} \
+                            -Dsonar.token=${SONAR_TOKEN}
+                    """
+                }
+            }
+        }
+
+        stage('Quality Gate') {
+            steps {
+                timeout(time: 2, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        stage('ECR Login') {
+            steps {
+                sh """
+                    aws ecr get-login-password --region <YOUR_REGION> | \
+                    docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                """
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh "docker build -t ${IMAGE_REPO}:${BUILD_NUMBER} -f docker/Dockerfile app/"
+            }
+        }
+
+        stage('Trivy Image Scan') {
+            steps {
+                sh "trivy image --exit-code 0 --severity HIGH,CRITICAL --format table ${IMAGE_REPO}:${BUILD_NUMBER}"
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                sh """
+                    docker tag ${IMAGE_REPO}:${BUILD_NUMBER} ${ECR_REGISTRY}/${IMAGE_REPO}:${BUILD_NUMBER}
+                    docker tag ${IMAGE_REPO}:${BUILD_NUMBER} ${ECR_REGISTRY}/${IMAGE_REPO}:latest
+                    docker push ${ECR_REGISTRY}/${IMAGE_REPO}:${BUILD_NUMBER}
+                    docker push ${ECR_REGISTRY}/${IMAGE_REPO}:latest
+                """
+            }
+        }
+
+        stage('Update Deployment Manifest') {
+            steps {
+                sh "sed -i 's|IMAGE_TAG|${ECR_REGISTRY}/${IMAGE_REPO}:${BUILD_NUMBER}|g' k8s/deploy-svc.yaml"
+            }
+        }
+
+        stage('Deploy to Kubernetes') {
+            steps {
+                sh """
+                    aws eks update-kubeconfig --region <YOUR_REGION> --name <YOUR_CLUSTER_NAME>
+                    kubectl create namespace devsecops-demo --dry-run=client -o yaml | kubectl apply -f -
+                    kubectl apply -f k8s/clusterrole-binding.yaml
+                    kubectl apply -f k8s/deploy-svc.yaml -n devsecops-demo
+                    kubectl rollout status deployment/devsecops-demo -n devsecops-demo
+                """
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Pipeline completed successfully. Build #${BUILD_NUMBER} deployed to EKS."
+        }
+        failure {
+            echo "Pipeline failed at build #${BUILD_NUMBER}. Check stage logs for details."
+        }
+        always {
+            cleanWs()
+        }
+    }
+}
