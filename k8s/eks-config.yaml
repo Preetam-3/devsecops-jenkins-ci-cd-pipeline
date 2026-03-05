@@ -1,0 +1,31 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: devsecops-eks
+  region: ap-south-1
+  version: "1.32"
+
+iam:
+  withOIDC: true
+
+managedNodeGroups:
+  - name: ng-public
+    instanceType: t3.small
+    desiredCapacity: 2
+    minSize: 2
+    maxSize: 2
+    amiFamily: AmazonLinux2
+    ssh:
+      allow: true
+      publicKeyName: <YOUR_EC2_KEY_PAIR>
+    labels:
+      app: devsecops-demo
+    tags:
+      app: devsecops-demo
+
+addons:
+  - name: cluster-autoscaler
+  - name: aws-ebs-csi-driver
+  - name: aws-load-balancer-controller
+  - name: external-dns
